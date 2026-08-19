@@ -1,0 +1,331 @@
+#include "d2r_binding.h"
+
+#include "d2r_methods.h"
+#include "offsets.h"
+
+#include <Windows.h>
+
+#include <nyx/env.h>
+#include <nyx/extension.h>
+#include <nyx/isolate_data.h>
+#include <nyx/util.h>
+
+#include <dolos/pipe_log.h>
+
+#include <string>
+
+namespace d2r {
+
+using nyx::Environment;
+using v8::BigInt;
+using v8::Context;
+using v8::FunctionCallbackInfo;
+using v8::HandleScope;
+using v8::Isolate;
+using v8::Local;
+using v8::ObjectTemplate;
+using v8::String;
+using v8::Value;
+
+namespace {
+constexpr ULONGLONG kAutomapModeCacheMs = 50;
+ULONGLONG s_automap_mode_cache_ts = 0;
+uint32_t s_automap_mode_cache_value = 0;
+bool s_automap_mode_cache_valid = false;
+
+bool AllowProtectedBindingCall(const char* binding_name) {
+  if (RetcheckBypass::IsOperational()) {
+    return true;
+  }
+  static ULONGLONG s_last_log_ms = 0;
+  if (ShouldLogNow(&s_last_log_ms, 5000)) {
+    PIPE_LOG_WARN("[BindingGuard] {} blocked: no operational retcheck implementation", binding_name);
+  }
+  return false;
+}
+
+uint32_t GetAutomapModeCached(bool* from_cache = nullptr) {
+  ULONGLONG now = GetTickCount64();
+  if (s_automap_mode_cache_valid && now - s_automap_mode_cache_ts <= kAutomapModeCacheMs) {
+    if (from_cache) *from_cache = true;
+    return s_automap_mode_cache_value;
+  }
+
+  s_automap_mode_cache_value = AutoMapPanel_GetMode();
+  s_automap_mode_cache_ts = now;
+  s_automap_mode_cache_valid = true;
+  if (from_cache) *from_cache = false;
+  return s_automap_mode_cache_value;
+}
+
+bool ParseRuntimeMode(Isolate* isolate, Local<Value> value, RuntimeMode* out_mode) {
+  if (out_mode == nullptr || value.IsEmpty()) {
+    return false;
+  }
+
+  if (value->IsUint32()) {
+    uint32_t mode_raw = value->Uint32Value(isolate->GetCurrentContext()).FromMaybe(0);
+    if (mode_raw == static_cast<uint32_t>(RuntimeMode::ReadOnlySafe)) {
+      *out_mode = RuntimeMode::ReadOnlySafe;
+      return true;
+    }
+    if (mode_raw == static_cast<uint32_t>(RuntimeMode::ActiveMutation)) {
+      *out_mode = RuntimeMode::ActiveMutation;
+      return true;
+    }
+    return false;
+  }
+
+  if (!value->IsString()) {
+    return false;
+  }
+
+  String::Utf8Value utf8(isolate, value);
+  if (*utf8 == nullptr) {
+    return false;
+  }
+
+  std::string mode(*utf8);
+  if (mode == "read_only_safe" || mode == "safe") {
+    *out_mode = RuntimeMode::ReadOnlySafe;
+    return true;
+  }
+  if (mode == "active_mutation" || mode == "active") {
+    *out_mode = RuntimeMode::ActiveMutation;
+    return true;
+  }
+
+  return false;
+}
+}  // namespace
+
+void AutomapGetMode(const FunctionCallbackInfo<Value>& args) {
+  if (!AllowProtectedBindingCall("automapGetMode")) {
+    args.GetReturnValue().Set(0);
+    return;
+  }
+  args.GetReturnValue().Set(GetAutomapModeCached());
+}
+
+void WorldToAutomap(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope scope(isolate);
+  Environment* env = Environment::GetCurrent(isolate);
+  Local<Context> context = env->context();
+
+  // default return
+  ImVec2 xy(-1.0f, -1.0f);
+  args.GetReturnValue().Set(xy.ToObject(context));
+  if (!AllowProtectedBindingCall("worldToAutomap")) {
+    return;
+  }
+
+  D2CoordStrc ptCoords(static_cast<int32_t>(args[0]->Int32Value(context).FromMaybe(0)),
+                       static_cast<int32_t>(args[1]->Int32Value(context).FromMaybe(0)));
+  PIPE_LOG_TRACE("Converting {}, {} to automap coords", ptCoords.nX, ptCoords.nY);
+
+  // 16-byte alignement otherwise SIMD operations crash
+  alignas(16) RectInt ptRect = {0, 0, 0, 0};
+  Vector2i ptCenter;
+  float flFinalScale;
+
+  if (s_panelManager == nullptr || *s_panelManager == nullptr) {
+    PIPE_LOG_ERROR("Failed to get panel manager");
+    return;  // safety why not
+  }
+  PanelManager* panel_mgr = *s_panelManager;
+
+  Widget* ptAutoMap = panel_mgr->GetWidget("AutoMap");
+  if (ptAutoMap == nullptr) {
+    PIPE_LOG_ERROR("AutoMapPanel not found");
+    return;
+  }
+  PIPE_LOG_TRACE("Found AutoMapPanel at {:p}", static_cast<void*>(ptAutoMap));
+  if (!ptAutoMap->bEnabled || !ptAutoMap->bVisible) {
+    // PIPE_LOG_WARN("AutoMapPanel is disabled or not visible");
+    return;
+  }
+
+  uint32_t mode = GetAutomapModeCached();
+  PIPE_LOG_TRACE("mode = {}", mode);
+  if (mode == 1) {
+    // automap is in corner
+    Vector2i ptPosition;
+    Vector2i ptScaledSize;
+    Widget::GetScaledPosition(ptAutoMap, &ptPosition);
+    Widget::GetScaledSize(ptAutoMap, &ptScaledSize);
+    PIPE_LOG_TRACE("Scaled position = {}, {}", ptPosition.x, ptPosition.y);
+    PIPE_LOG_TRACE("Scaled size = {}, {}", ptScaledSize.x, ptScaledSize.y);
+    ptRect = {ptPosition, ptScaledSize};
+    ptCenter = ptRect.center();
+    flFinalScale = ptAutoMap->GetScale() * (*(float*)((uint64_t)ptAutoMap + 0x15AC));
+  } else {
+    // automap is in center
+    Vector2i ptPosition;
+    Vector2i ptScaledSize;
+    Widget::GetScaledPosition(panel_mgr, &ptPosition);
+    Widget::GetScaledSize(panel_mgr, &ptScaledSize);
+    PIPE_LOG_TRACE("Scaled position = {}, {}", ptPosition.x, ptPosition.y);
+    PIPE_LOG_TRACE("Scaled size = {}, {}", ptScaledSize.x, ptScaledSize.y);
+    ptRect = {ptPosition, ptScaledSize};
+    ptCenter = ptRect.center();
+
+    uint32_t shift = *AutoMapPanel_spdwShift;
+    PIPE_LOG_TRACE("Shift = {}", shift);
+    if (shift == 1) {
+      // automap is shifted to the left
+      ptCenter.x -= PanelManager::GetScreenSizeX() / 4;
+    } else if (shift == 2) {
+      // automap is shifted to the right
+      ptCenter.x += PanelManager::GetScreenSizeX() / 4;
+    }
+    PIPE_LOG_TRACE("ptCenter = {}, {}", ptCenter.x, ptCenter.y);
+
+    flFinalScale = ptAutoMap->GetScale() * (*(float*)((uint64_t)ptAutoMap + 0x15A8));
+  }
+
+  AutoMapData automap_data{};
+  PIPE_LOG_TRACE("AutoMapData inputs");
+  PIPE_LOG_TRACE("  ptRect: {}, {}, {}, {}", ptRect.left, ptRect.top, ptRect.right, ptRect.bottom);
+  PIPE_LOG_TRACE("  ptCenter: {}, {}", ptCenter.x, ptCenter.y);
+  PIPE_LOG_TRACE("  flFinalSize: {}", flFinalScale);
+  AutoMapPanel_CreateAutoMapData(&automap_data, &ptRect, *(uint64_t*)&ptCenter.x, flFinalScale);
+  PIPE_LOG_TRACE("AutoMapData output");
+  PIPE_LOG_TRACE("  automap_data.unk_0000: {}", automap_data.unk_0000);
+  PIPE_LOG_TRACE("  automap_data.unk_0008: {}", automap_data.unk_0008);
+  PIPE_LOG_TRACE("  automap_data.unk_0010: {}", automap_data.unk_0010);
+  PIPE_LOG_TRACE("  automap_data.unk_0018: {}", automap_data.unk_0018);
+  PIPE_LOG_TRACE("  automap_data.unk_0020: {}", automap_data.unk_0020);
+  PIPE_LOG_TRACE("  automap_data.unk_0028: {}", automap_data.unk_0028);
+  PIPE_LOG_TRACE("  automap_data.unk_0030: {}", automap_data.unk_0030);
+  PIPE_LOG_TRACE("  automap_data.unk_0034: {}", automap_data.unk_0034);
+  PIPE_LOG_TRACE("  automap_data.unk_0038: {}", automap_data.unk_0038);
+
+  int64_t nPrecision = *(int64_t*)&ptCoords.nX;
+  PIPE_LOG_TRACE("PrecisionToAutomap inputs");
+  PIPE_LOG_TRACE("  nPrecision: {} ({}, {})", nPrecision, ptCoords.nX, ptCoords.nY);
+  AutoMapPanel_PrecisionToAutomap(&automap_data, &nPrecision, nPrecision);
+  PIPE_LOG_TRACE("PrecisionToAutomap outputs");
+  PIPE_LOG_TRACE("  nPrecision: {} ({}, {})", nPrecision, ptCoords.nX, ptCoords.nY);
+  PIPE_LOG_TRACE("  automap_data.unk_0000: {}", automap_data.unk_0000);
+  PIPE_LOG_TRACE("  automap_data.unk_0008: {}", automap_data.unk_0008);
+  PIPE_LOG_TRACE("  automap_data.unk_0010: {}", automap_data.unk_0010);
+  PIPE_LOG_TRACE("  automap_data.unk_0018: {}", automap_data.unk_0018);
+  PIPE_LOG_TRACE("  automap_data.unk_0020: {}", automap_data.unk_0020);
+  PIPE_LOG_TRACE("  automap_data.unk_0028: {}", automap_data.unk_0028);
+  PIPE_LOG_TRACE("  automap_data.unk_0030: {}", automap_data.unk_0030);
+  PIPE_LOG_TRACE("  automap_data.unk_0034: {}", automap_data.unk_0034);
+  PIPE_LOG_TRACE("  automap_data.unk_0038: {}", automap_data.unk_0038);
+
+  ptCoords.nX = (int)nPrecision;
+  ptCoords.nY = (int)(nPrecision >> 32);
+
+  PIPE_LOG_TRACE("Final result = {}, {}", ptCoords.nX, ptCoords.nY);
+  xy = ImVec2(ptCoords.nX, ptCoords.nY);
+  args.GetReturnValue().Set(xy.ToObject(context));
+}
+
+void RevealLevel(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Environment* env = Environment::GetCurrent(isolate);
+  Local<Context> context = env->context();
+  if (!AllowProtectedBindingCall("revealLevel")) {
+    args.GetReturnValue().Set(false);
+    return;
+  }
+  if (!args[0]->IsUint32()) {
+    return;
+  }
+  uint32_t level_id = args[0]->Uint32Value(context).FromJust();
+  args.GetReturnValue().Set(RevealLevelById(level_id));
+}
+
+static void GetRuntimeModeBinding(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  const char* mode_name = GetRuntimeModeName(GetRuntimeMode());
+  args.GetReturnValue().Set(String::NewFromUtf8(isolate, mode_name, v8::NewStringType::kNormal).ToLocalChecked());
+}
+
+static void SetRuntimeModeBinding(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  RuntimeMode mode = RuntimeMode::ReadOnlySafe;
+  if (args.Length() < 1 || !ParseRuntimeMode(isolate, args[0], &mode)) {
+    PIPE_LOG_WARN("[RuntimeMode] Invalid mode argument to setRuntimeMode");
+    args.GetReturnValue().Set(false);
+    return;
+  }
+#ifdef NYX_D2R_SAFE_READ_ONLY_RUNTIME
+  if (mode != RuntimeMode::ReadOnlySafe) {
+    PIPE_LOG_WARN("[RuntimeMode] Active mutation is disabled by the read-only diagnostic build");
+    args.GetReturnValue().Set(false);
+    return;
+  }
+#endif
+  SetRuntimeMode(mode);
+  args.GetReturnValue().Set(true);
+}
+
+static void IsActiveMutationEnabledBinding(const FunctionCallbackInfo<Value>& args) {
+  args.GetReturnValue().Set(IsActiveMutationEnabled());
+}
+
+// will break on patch, look at the end of GetPlayerUnit for decryption method
+static void GetPlayerIdByIndex(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Environment* env = Environment::GetCurrent(isolate);
+  Local<Context> context = env->context();
+  if (!args[0]->IsUint32()) {
+    return args.GetReturnValue().Set(-1);
+  }
+  uint32_t idx = args[0]->Uint32Value(context).FromJust();
+  if (idx < 0 || idx >= 8) {
+    return args.GetReturnValue().Set(-1);
+  };
+
+  uint32_t id = GetPlayerId(idx);
+  args.GetReturnValue().Set(id);
+}
+
+static void GetLocalPlayerIndex(const FunctionCallbackInfo<Value>& args) {
+  args.GetReturnValue().Set(*s_PlayerUnitIndex);
+}
+
+void GetClientSideUnitHashTableAddress(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  uint64_t addr = reinterpret_cast<uint64_t>(sgptClientSideUnitHashTable);
+  args.GetReturnValue().Set(BigInt::NewFromUnsigned(isolate, addr));
+}
+
+void GetServerSideUnitHashTableAddress(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  EntityHashTable* server_block =
+      sgptClientSideUnitHashTable == nullptr
+          ? nullptr
+          : sgptClientSideUnitHashTable + kUnitTypeCount;
+  uint64_t addr = reinterpret_cast<uint64_t>(server_block);
+  args.GetReturnValue().Set(BigInt::NewFromUnsigned(isolate, addr));
+}
+
+void InitD2RBinding(nyx::IsolateData* isolate_data, Local<ObjectTemplate> target) {
+  Isolate* isolate = isolate_data->isolate();
+
+  nyx::SetMethod(isolate, target, "log", [](const FunctionCallbackInfo<Value>& args) {
+    Isolate* isolate = args.GetIsolate();
+    HandleScope handle_scope(isolate);
+    nyx::Utf8Value utf8(isolate, args[0]);
+    PIPE_LOG(*utf8);
+  });
+
+  nyx::SetMethod(isolate, target, "automapGetMode", AutomapGetMode);
+  nyx::SetMethod(isolate, target, "worldToAutomap", WorldToAutomap);
+  nyx::SetMethod(isolate, target, "revealLevel", RevealLevel);
+  nyx::SetMethod(isolate, target, "getRuntimeMode", GetRuntimeModeBinding);
+  nyx::SetMethod(isolate, target, "setRuntimeMode", SetRuntimeModeBinding);
+  nyx::SetMethod(isolate, target, "isActiveMutationEnabled", IsActiveMutationEnabledBinding);
+  nyx::SetMethod(isolate, target, "getPlayerIdByIndex", GetPlayerIdByIndex);
+  nyx::SetMethod(isolate, target, "getLocalPlayerIndex", GetLocalPlayerIndex);
+  nyx::SetMethod(isolate, target, "getClientSideUnitHashTableAddress", GetClientSideUnitHashTableAddress);
+  nyx::SetMethod(isolate, target, "getServerSideUnitHashTableAddress", GetServerSideUnitHashTableAddress);
+}
+
+}  // namespace d2r

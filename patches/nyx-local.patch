@@ -1,0 +1,834 @@
+diff --git a/dolos/src/dolos/backend/d3d12_renderer.cc b/dolos/src/dolos/backend/d3d12_renderer.cc
+index 3622c5b..8d90d56 100644
+--- a/dolos/src/dolos/backend/d3d12_renderer.cc
++++ b/dolos/src/dolos/backend/d3d12_renderer.cc
+@@ -203,7 +203,7 @@ HRESULT D3D12Renderer::Present(IDXGISwapChain* self, UINT SyncInterval, UINT Fla
+       self->GetDevice(IID_PPV_ARGS(&device));
+       imgui_.Initialize(device,
+                         static_cast<int>(frames_.size()),
+-                        DXGI_FORMAT_R8G8B8A8_UNORM,
++                        swapchain_format_,
+                         srv_heap_.Get(),
+                         srv_heap_->GetCPUDescriptorHandleForHeapStart(),
+                         srv_heap_->GetGPUDescriptorHandleForHeapStart());
+@@ -241,11 +241,18 @@ HRESULT D3D12Renderer::Present(IDXGISwapChain* self, UINT SyncInterval, UINT Fla
+       command_list_->OMSetRenderTargets(1, &frame.rtd, FALSE, nullptr);
+       command_list_->SetDescriptorHeaps(1, srv_heap_.GetAddressOf());
+ 
++      int background_lists = 0;
++      int background_vertices = 0;
++      int foreground_lists = 0;
++      int foreground_vertices = 0;
++
+       // TODO: move background drawlist to a game hook instead to be drawn under GUI
+       {
+         auto* bg = nyx_imgui_->background();
+         ImDrawData* data = bg->Acquire();
+         if (data) {
++          background_lists = data->CmdListsCount;
++          background_vertices = data->TotalVtxCount;
+           if (data->Valid) {
+             imgui_.RenderDrawData(data, command_list_.Get());
+           }
+@@ -257,6 +264,8 @@ HRESULT D3D12Renderer::Present(IDXGISwapChain* self, UINT SyncInterval, UINT Fla
+         auto* fg = nyx_imgui_->foreground();
+         ImDrawData* data = fg->Acquire();
+         if (data) {
++          foreground_lists = data->CmdListsCount;
++          foreground_vertices = data->TotalVtxCount;
+           if (data->Valid) {
+             imgui_.RenderDrawData(data, command_list_.Get());
+           }
+@@ -267,8 +276,33 @@ HRESULT D3D12Renderer::Present(IDXGISwapChain* self, UINT SyncInterval, UINT Fla
+       barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+       barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+       command_list_->ResourceBarrier(1, &barrier);
+-      command_list_->Close();
+-      command_queue_->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList* const*>(command_list_.GetAddressOf()));
++      const HRESULT close_result = command_list_->Close();
++      if (SUCCEEDED(close_result)) {
++        command_queue_->ExecuteCommandLists(
++            1, reinterpret_cast<ID3D12CommandList* const*>(command_list_.GetAddressOf()));
++      }
++
++      ++rendered_frame_count_;
++      const auto now = std::chrono::steady_clock::now();
++      if (last_render_diagnostic_.time_since_epoch().count() == 0 ||
++          now - last_render_diagnostic_ >= std::chrono::seconds(1)) {
++        ID3D12Device* render_device = nullptr;
++        const HRESULT device_result = self->GetDevice(IID_PPV_ARGS(&render_device));
++        const HRESULT device_status = SUCCEEDED(device_result) ? render_device->GetDeviceRemovedReason() : device_result;
++        if (render_device) {
++          render_device->Release();
++        }
++        PIPE_LOG("[RendererDiag] frame={} format={} bg_lists={} bg_vertices={} fg_lists={} fg_vertices={} close=0x{:08X} device=0x{:08X}",
++                 rendered_frame_count_,
++                 static_cast<int>(swapchain_format_),
++                 background_lists,
++                 background_vertices,
++                 foreground_lists,
++                 foreground_vertices,
++                 static_cast<unsigned int>(close_result),
++                 static_cast<unsigned int>(device_status));
++        last_render_diagnostic_ = now;
++      }
+     } break;
+ 
+     case kShutdown:
+@@ -323,6 +357,13 @@ HRESULT D3D12Renderer::CreateRenderTargets(IDXGISwapChain* pSwapChain) {
+ 
+   DXGI_SWAP_CHAIN_DESC sd;
+   pSwapChain->GetDesc(&sd);
++  swapchain_format_ = sd.BufferDesc.Format;
++  PIPE_LOG("[Renderer] Swapchain format={} size={}x{} buffers={} windowed={}",
++           static_cast<int>(swapchain_format_),
++           sd.BufferDesc.Width,
++           sd.BufferDesc.Height,
++           sd.BufferCount,
++           sd.Windowed ? 1 : 0);
+   window_->SetActiveWindow(sd.OutputWindow);
+   frames_.resize(sd.BufferCount);
+ 
+diff --git a/dolos/src/dolos/backend/d3d12_renderer.h b/dolos/src/dolos/backend/d3d12_renderer.h
+index 61b736f..818a22c 100644
+--- a/dolos/src/dolos/backend/d3d12_renderer.h
++++ b/dolos/src/dolos/backend/d3d12_renderer.h
+@@ -8,6 +8,7 @@
+ #include <d3d12.h>
+ #include <dxgi1_4.h>
+ #include <wrl.h>
++#include <chrono>
+ #include <vector>
+ 
+ using Microsoft::WRL::ComPtr;
+@@ -51,6 +52,9 @@ class D3D12Renderer : public Renderer {
+   ComPtr<ID3D12DescriptorHeap> srv_heap_;
+   ComPtr<ID3D12GraphicsCommandList> command_list_;
+   size_t fixme_shutdown_ticks_;
++  DXGI_FORMAT swapchain_format_ = DXGI_FORMAT_UNKNOWN;
++  uint64_t rendered_frame_count_ = 0;
++  std::chrono::steady_clock::time_point last_render_diagnostic_{};
+ 
+   Detour<decltype(&IDXGISwapChain::Present)> present_;
+   Detour<decltype(&IDXGISwapChain::ResizeBuffers)> resize_buffers_;
+diff --git a/dolos/src/dolos/backend/win32_window.cc b/dolos/src/dolos/backend/win32_window.cc
+index df7bdfc..1c9343e 100644
+--- a/dolos/src/dolos/backend/win32_window.cc
++++ b/dolos/src/dolos/backend/win32_window.cc
+@@ -306,6 +306,21 @@ void Win32Window::SetActiveWindow(HWND hWnd) {
+     PIPE_LOG("[Window] Setting active output window to {:p}", static_cast<void*>(hWnd));
+     hwnd_ = hWnd;
+   }
++
++  if (hwnd_) {
++    RECT rect{};
++    if (::GetClientRect(hwnd_, &rect)) {
++      const LONG width = rect.right - rect.left;
++      const LONG height = rect.bottom - rect.top;
++      if (width > 0 && height > 0) {
++        nyx::ImGuiInputEvent ev;
++        ev.type = nyx::ImGuiInputEvent::kDisplaySize;
++        ev.display_size = {static_cast<float>(width), static_cast<float>(height)};
++        nyx_imgui_->PushInputEvent(ev);
++        PIPE_LOG("[Window] Initial display size {}x{}", width, height);
++      }
++    }
++  }
+ }
+ 
+ LRESULT Win32Window::WndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+diff --git a/dolos/src/dolos/dolos.cc b/dolos/src/dolos/dolos.cc
+index 8c94b1c..73cbe3a 100644
+--- a/dolos/src/dolos/dolos.cc
++++ b/dolos/src/dolos/dolos.cc
+@@ -157,7 +157,14 @@ DWORD CALLBACK ThreadEntry(LPVOID lpParameter) {
+     PIPE_LOG("[dolos] Connected to log server");
+   }
+ 
++#if defined(NYX_D2R_SAFE_DIAGNOSTIC_MODE) && !defined(NYX_D2R_SAFE_READ_ONLY_RUNTIME)
++  PIPE_LOG_WARN("[dolos] Safe diagnostic mode: MinHook initialization skipped");
++#else
+   MH_Initialize();
++#ifdef NYX_D2R_SAFE_READ_ONLY_RUNTIME
++  PIPE_LOG_WARN("[dolos] Guarded read-only runtime: MinHook initialized for window/render hooks only");
++#endif
++#endif
+ 
+   if (lpParameter) {
+     HMODULE hModule = static_cast<HMODULE>(lpParameter);
+@@ -174,6 +181,21 @@ DWORD CALLBACK ThreadEntry(LPVOID lpParameter) {
+     PIPE_LOG_WARN("[dolos] Game::OnInitialize failed");
+   }
+ 
++#if defined(NYX_D2R_SAFE_DIAGNOSTIC_MODE) && !defined(NYX_D2R_SAFE_READ_ONLY_RUNTIME)
++  PIPE_LOG_WARN("[dolos] Safe diagnostic mode active; skipping D3D/window hooks and nyx runtime");
++  game->OnShutdown();
++  delete game;
++  ShutdownPipeLog();
++  if (hModule) {
++    FreeLibraryAndExitThread(hModule, 0);
++  }
++  return 0;
++#endif
++
++#ifdef NYX_D2R_SAFE_READ_ONLY_RUNTIME
++  PIPE_LOG_WARN("[dolos] Guarded read-only runtime active; D3D/window hooks enabled, game mutation remains extension-blocked");
++#endif
++
+   nyx::RegisterBinding("dolos", InitDolosBinding);
+   dolos_builtins::RegisterBuiltins();
+ 
+diff --git a/dolos/src/dolos/pattern_scanner.cc b/dolos/src/dolos/pattern_scanner.cc
+index 36724ee..d6e88f6 100644
+--- a/dolos/src/dolos/pattern_scanner.cc
++++ b/dolos/src/dolos/pattern_scanner.cc
+@@ -4,8 +4,10 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <charconv>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iomanip>
+ #include <sstream>
+ #include <vector>
+ 
+@@ -98,9 +100,13 @@ bool PatternScanner::Initialize() {
+     return false;
+   }
+ 
++#ifdef NYX_D2R_SAFE_NO_THREAD_SUSPEND
++  PIPE_LOG_WARN("[PatternScanner] Safe diagnostic mode: thread suspension skipped");
++#else
+   if (!SuspendAllThreads()) {
+     PIPE_LOG_WARN("[PatternScanner] Failed to suspend threads, scanning anyway");
+   }
++#endif
+ 
+   module_base_ = reinterpret_cast<std::uintptr_t>(hModule);
+ 
+@@ -230,6 +236,283 @@ std::uintptr_t FindDecryptGadget(std::uintptr_t base, std::size_t size) {
+   return 0;
+ }
+ 
++struct FixedRun {
++  std::size_t start = 0;
++  std::size_t length = 0;
++};
++
++FixedRun FindLongestFixedRun(const ParsedPattern& pattern) {
++  FixedRun best;
++  FixedRun current;
++
++  for (std::size_t i = 0; i < pattern.mask.size(); ++i) {
++    if (pattern.mask[i]) {
++      if (current.length == 0) {
++        current.start = i;
++      }
++      ++current.length;
++      if (current.length > best.length) {
++        best = current;
++      }
++    } else {
++      current = {};
++    }
++  }
++
++  return best;
++}
++
++bool PatternMatchesAt(const std::vector<std::uint8_t>& buffer, const ParsedPattern& pattern, std::size_t offset) {
++  if (offset + pattern.bytes.size() > buffer.size()) {
++    return false;
++  }
++
++  for (std::size_t i = 0; i < pattern.bytes.size(); ++i) {
++    if (pattern.mask[i] && buffer[offset + i] != pattern.bytes[i]) {
++      return false;
++    }
++  }
++
++  return true;
++}
++
++std::vector<std::size_t> FindPatternMatches(const std::vector<std::uint8_t>& buffer,
++                                            const ParsedPattern& pattern,
++                                            std::size_t max_matches) {
++  std::vector<std::size_t> matches;
++  if (pattern.bytes.empty() || buffer.size() < pattern.bytes.size()) {
++    return matches;
++  }
++
++  const std::size_t scan_end = buffer.size() - pattern.bytes.size();
++  for (std::size_t i = 0; i <= scan_end; ++i) {
++    if (PatternMatchesAt(buffer, pattern, i)) {
++      matches.push_back(i);
++      if (matches.size() >= max_matches) {
++        break;
++      }
++    }
++  }
++
++  return matches;
++}
++
++std::string FormatBytes(const std::vector<std::uint8_t>& bytes, std::size_t start, std::size_t length) {
++  std::ostringstream out;
++  out << std::uppercase << std::hex << std::setfill('0');
++  for (std::size_t i = 0; i < length; ++i) {
++    if (i != 0) {
++      out << ' ';
++    }
++    out << std::setw(2) << static_cast<unsigned>(bytes[start + i]);
++  }
++  return out.str();
++}
++
++std::string FormatBytes(const std::uint8_t* bytes, std::size_t length) {
++  std::ostringstream out;
++  out << std::uppercase << std::hex << std::setfill('0');
++  for (std::size_t i = 0; i < length; ++i) {
++    if (i != 0) {
++      out << ' ';
++    }
++    out << std::setw(2) << static_cast<unsigned>(bytes[i]);
++  }
++  return out.str();
++}
++
++std::vector<std::size_t> FindFixedRunCandidates(const std::vector<std::uint8_t>& buffer,
++                                                const ParsedPattern& pattern,
++                                                FixedRun run,
++                                                std::size_t max_candidates) {
++  std::vector<std::size_t> candidates;
++  if (run.length == 0 || buffer.size() < run.length) {
++    return candidates;
++  }
++
++  for (std::size_t i = 0; i + run.length <= buffer.size(); ++i) {
++    if (std::memcmp(buffer.data() + i, pattern.bytes.data() + run.start, run.length) == 0) {
++      candidates.push_back(i);
++      if (candidates.size() >= max_candidates) {
++        break;
++      }
++    }
++  }
++
++  return candidates;
++}
++
++bool IsAddressInModule(std::uintptr_t address, std::uintptr_t module_base, std::size_t module_size) {
++  return address >= module_base && address < module_base + module_size;
++}
++
++bool IsRvaInExecutableSection(std::uint32_t rva, const std::vector<SectionInfo>& sections) {
++  for (const auto& section : sections) {
++    const auto section_start = section.virtual_address;
++    const auto section_end = section.virtual_address + section.virtual_size;
++    if (rva >= section_start && rva < section_end) {
++      return (section.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
++    }
++  }
++
++  return false;
++}
++
++SignatureMatchDiagnostic BuildMatchDiagnostic(const ParsedPattern& pattern,
++                                              OffsetType offset_type,
++                                              const std::vector<std::uint8_t>& buffer,
++                                              std::uintptr_t module_base,
++                                              std::size_t module_size,
++                                              std::size_t match,
++                                              bool accepted) {
++  void* resolved = reinterpret_cast<void*>(module_base + match);
++  if (pattern.has_offset_marker) {
++    resolved = PatternScanner::ResolveOffset(module_base + match,
++                                             pattern.offset_position,
++                                             offset_type,
++                                             buffer.data() + match);
++  }
++
++  const auto resolved_addr = reinterpret_cast<std::uintptr_t>(resolved);
++  return {
++      static_cast<std::uint64_t>(match),
++      static_cast<std::uint64_t>(resolved_addr - module_base),
++      IsAddressInModule(resolved_addr, module_base, module_size),
++      accepted,
++  };
++}
++
++void LogExactMatch(const char* name,
++                   const ParsedPattern& pattern,
++                   OffsetType offset_type,
++                   const std::vector<std::uint8_t>& buffer,
++                   std::uintptr_t module_base,
++                   std::size_t module_size,
++                   std::size_t match) {
++  void* resolved = reinterpret_cast<void*>(module_base + match);
++  if (pattern.has_offset_marker) {
++    resolved = PatternScanner::ResolveOffset(module_base + match,
++                                             pattern.offset_position,
++                                             offset_type,
++                                             buffer.data() + match);
++  }
++
++  const auto resolved_addr = reinterpret_cast<std::uintptr_t>(resolved);
++  const bool in_image = IsAddressInModule(resolved_addr, module_base, module_size);
++  const auto resolved_rva = static_cast<std::uint32_t>(resolved_addr - module_base);
++
++  constexpr std::size_t kContextBytes = 48;
++  const std::size_t context_start = match > kContextBytes ? match - kContextBytes : 0;
++  const std::size_t context_end = std::min(buffer.size(), match + pattern.bytes.size() + kContextBytes);
++  const std::size_t context_length = context_end - context_start;
++
++  PIPE_LOG_WARN("[PatternScanner]   {} exact match RVA=0x{:08X} VA={:p} resolved RVA=0x{:08X} in_image={}",
++                name,
++                static_cast<std::uint32_t>(match),
++                reinterpret_cast<void*>(module_base + match),
++                resolved_rva,
++                in_image ? "yes" : "no");
++  PIPE_LOG_DEBUG("[PatternScanner]   {} exact context RVA=0x{:08X} match_offset={} bytes={}",
++                 name,
++                 static_cast<std::uint32_t>(context_start),
++                 match - context_start,
++                 FormatBytes(buffer.data() + context_start, context_length));
++}
++
++void LogMissingPatternDiagnostics(const char* name,
++                                  const ParsedPattern& pattern,
++                                  OffsetType offset_type,
++                                  const std::vector<std::uint8_t>& buffer,
++                                  std::uintptr_t module_base,
++                                  std::size_t module_size) {
++  FixedRun run = FindLongestFixedRun(pattern);
++  if (run.length < 3) {
++    PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: no useful fixed anchor in pattern", name);
++    return;
++  }
++
++  const std::size_t kMaxCandidates = run.length >= 4 ? 5 : 3;
++  std::vector<std::size_t> candidates = FindFixedRunCandidates(buffer, pattern, run, kMaxCandidates);
++  std::string anchor = FormatBytes(pattern.bytes, run.start, run.length);
++
++  if (candidates.empty()) {
++    PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: longest anchor not found (offset={}, bytes={})",
++                   name,
++                   run.start,
++                   anchor);
++    return;
++  }
++
++  PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: longest anchor matched {}{} time(s) (offset={}, bytes={})",
++                 name,
++                 candidates.size(),
++                 candidates.size() == kMaxCandidates ? "+" : "",
++                 run.start,
++                 anchor);
++  if (run.length == 3) {
++    PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: weak 3-byte anchor only; candidate list is exploratory", name);
++  }
++  for (std::size_t candidate : candidates) {
++    constexpr std::size_t kContextBytes = 48;
++    const std::size_t context_start = candidate > kContextBytes ? candidate - kContextBytes : 0;
++    const std::size_t context_end = std::min(buffer.size(), candidate + run.length + kContextBytes);
++    const std::size_t context_length = context_end - context_start;
++
++    PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: anchor candidate RVA=0x{:08X} VA={:p}",
++                   name,
++                   static_cast<std::uint32_t>(candidate),
++                   reinterpret_cast<void*>(module_base + candidate));
++    PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: context RVA=0x{:08X} anchor_offset={} bytes={}",
++                   name,
++                   static_cast<std::uint32_t>(context_start),
++                   candidate - context_start,
++                   FormatBytes(buffer.data() + context_start, context_length));
++
++    if (pattern.has_offset_marker && candidate >= run.start) {
++      const std::size_t candidate_pattern_start = candidate - run.start;
++      if (candidate_pattern_start + pattern.bytes.size() <= buffer.size()) {
++        void* resolved = PatternScanner::ResolveOffset(module_base + candidate_pattern_start,
++                                                       pattern.offset_position,
++                                                       offset_type,
++                                                       buffer.data() + candidate_pattern_start);
++        const auto resolved_addr = reinterpret_cast<std::uintptr_t>(resolved);
++        const bool in_image = IsAddressInModule(resolved_addr, module_base, module_size);
++        const auto resolved_rva = static_cast<std::uint32_t>(resolved_addr - module_base);
++        PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: candidate pattern-start RVA=0x{:08X}, opcode=0x{:02X}, resolved RVA=0x{:08X}, in_image={}",
++                       name,
++                       static_cast<std::uint32_t>(candidate_pattern_start),
++                       static_cast<unsigned>(buffer[candidate_pattern_start]),
++                       resolved_rva,
++                       in_image ? "yes" : "no");
++      }
++    }
++
++    const std::size_t call_window_start = candidate > 64 ? candidate - 64 : 0;
++    const std::size_t call_window_end = std::min(buffer.size(), candidate + run.length + 64);
++    for (std::size_t call_rva = call_window_start; call_rva + 5 <= call_window_end; ++call_rva) {
++      if (buffer[call_rva] != 0xE8) {
++        continue;
++      }
++
++      void* call_target = PatternScanner::ResolveOffset(module_base + call_rva,
++                                                        1,
++                                                        OffsetType::Relative32Add,
++                                                        buffer.data() + call_rva);
++      const auto target_addr = reinterpret_cast<std::uintptr_t>(call_target);
++      const bool target_in_image = IsAddressInModule(target_addr, module_base, module_size);
++      const auto target_rva = static_cast<std::uint32_t>(target_addr - module_base);
++      const auto delta = static_cast<std::int64_t>(call_rva) - static_cast<std::int64_t>(candidate);
++
++      PIPE_LOG_DEBUG("[PatternScanner] Diagnostic {}: nearby call RVA=0x{:08X}, delta_from_anchor={}, target RVA=0x{:08X}, in_image={}",
++                     name,
++                     static_cast<std::uint32_t>(call_rva),
++                     delta,
++                     target_rva,
++                     target_in_image ? "yes" : "no");
++    }
++  }
++}
++
+ }  // namespace
+ 
+ bool PatternScanner::CopyExecutableMemory() {
+@@ -239,6 +522,9 @@ bool PatternScanner::CopyExecutableMemory() {
+ 
+   std::uintptr_t end_addr = module_base_ + module_size_;
+ 
++#ifdef NYX_D2R_SAFE_NO_DECRYPT_TOUCH
++  PIPE_LOG_WARN("[PatternScanner] Safe diagnostic mode: decrypt gadget calls skipped");
++#else
+   std::uintptr_t gadget_addr = FindDecryptGadget(module_base_, module_size_);
+   if (gadget_addr != 0) {
+     PIPE_LOG_DEBUG("[PatternScanner] Found decrypt gadget at {:p}", reinterpret_cast<void*>(gadget_addr));
+@@ -250,6 +536,7 @@ bool PatternScanner::CopyExecutableMemory() {
+     PIPE_LOG_ERROR("[PatternScanner] No decrypt gadget found, aborting");
+     return false;
+   }
++#endif
+ 
+   std::uintptr_t addr = module_base_;
+   std::size_t copied_regions = 0;
+@@ -261,12 +548,14 @@ bool PatternScanner::CopyExecutableMemory() {
+       break;
+     }
+ 
++#ifndef NYX_D2R_SAFE_NO_DECRYPT_TOUCH
+     if (DecryptGadget && mbi.BaseAddress && mbi.RegionSize && mbi.State == MEM_COMMIT &&
+         (mbi.Protect & PAGE_NOACCESS)) {
+       DecryptAddress(reinterpret_cast<std::uint64_t>(mbi.BaseAddress));
+       VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi));
+       ++decrypted_regions;
+     }
++#endif
+ 
+     if (mbi.BaseAddress && mbi.RegionSize && mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect)) {
+       std::uintptr_t region_start = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+@@ -360,6 +649,7 @@ void* PatternScanner::ResolveOffset(std::uintptr_t match_addr,
+       std::int32_t rel = *reinterpret_cast<const std::int32_t*>(offset_ptr);
+       return reinterpret_cast<void*>(match_addr + offset_pos + 4 + rel);
+     }
++
+   }
+ 
+   return nullptr;
+@@ -398,6 +688,8 @@ bool PatternScanner::ScanAll(std::vector<SignatureDef>& signatures) {
+   std::size_t found_count = 0;
+ 
+   for (auto& sig : signatures) {
++    sig.diagnostics.clear();
++
+     if (!sig.parsed.has_value()) {
+       sig.parsed = ParsedPattern::Parse(sig.pattern);
+       if (!sig.parsed.has_value()) {
+@@ -411,10 +703,31 @@ bool PatternScanner::ScanAll(std::vector<SignatureDef>& signatures) {
+     std::size_t buffer_offset = ScanBuffer(pattern);
+     if (buffer_offset == SIZE_MAX) {
+       PIPE_LOG_DEBUG("[PatternScanner] Pattern not found: {}", sig.name);
++#ifdef NYX_D2R_SAFE_DIAGNOSTIC_MODE
++      LogMissingPatternDiagnostics(sig.name, pattern, sig.offset_type, buffer_, module_base_, module_size_);
++#endif
+       *sig.target = nullptr;
+       continue;
+     }
+ 
++#ifdef NYX_D2R_SAFE_DIAGNOSTIC_MODE
++    constexpr std::size_t kMaxExactMatches = 6;
++    std::vector<std::size_t> exact_matches = FindPatternMatches(buffer_, pattern, kMaxExactMatches);
++    if (exact_matches.size() > 1) {
++      PIPE_LOG_WARN("[PatternScanner] Rejected {}: pattern is not unique ({}{} exact matches)",
++                    sig.name,
++                    exact_matches.size(),
++                    exact_matches.size() == kMaxExactMatches ? "+" : "");
++      for (std::size_t match : exact_matches) {
++        sig.diagnostics.push_back(
++            BuildMatchDiagnostic(pattern, sig.offset_type, buffer_, module_base_, module_size_, match, false));
++        LogExactMatch(sig.name, pattern, sig.offset_type, buffer_, module_base_, module_size_, match);
++      }
++      *sig.target = nullptr;
++      continue;
++    }
++#endif
++
+     std::uintptr_t match_addr = module_base_ + buffer_offset;
+     void* resolved;
+ 
+@@ -426,6 +739,41 @@ bool PatternScanner::ScanAll(std::vector<SignatureDef>& signatures) {
+       resolved = ResolveOffset(match_addr, pattern.offset_position, sig.offset_type, buffer_.data() + buffer_offset);
+     }
+ 
++    const auto resolved_addr = reinterpret_cast<std::uintptr_t>(resolved);
++#ifdef NYX_D2R_SAFE_DIAGNOSTIC_MODE
++    if (!pattern.has_offset_marker &&
++        !IsRvaInExecutableSection(static_cast<std::uint32_t>(buffer_offset), sections_)) {
++      PIPE_LOG_WARN("[PatternScanner] Rejected {} match at RVA=0x{:08X}: prologue match is not in executable memory",
++                    sig.name,
++                    static_cast<std::uint32_t>(buffer_offset));
++      sig.diagnostics.push_back(
++          BuildMatchDiagnostic(pattern, sig.offset_type, buffer_, module_base_, module_size_, buffer_offset, false));
++      LogExactMatch(sig.name, pattern, sig.offset_type, buffer_, module_base_, module_size_, buffer_offset);
++      *sig.target = nullptr;
++      continue;
++    }
++#endif
++
++    if (!IsAddressInModule(resolved_addr, module_base_, module_size_)) {
++      PIPE_LOG_WARN("[PatternScanner] Rejected {} match at RVA=0x{:08X}: resolved target outside module ({:p})",
++                    sig.name,
++                    static_cast<std::uint32_t>(buffer_offset),
++                    resolved);
++#ifdef NYX_D2R_SAFE_DIAGNOSTIC_MODE
++      sig.diagnostics.push_back(
++          BuildMatchDiagnostic(pattern, sig.offset_type, buffer_, module_base_, module_size_, buffer_offset, false));
++      LogMissingPatternDiagnostics(sig.name, pattern, sig.offset_type, buffer_, module_base_, module_size_);
++#endif
++      *sig.target = nullptr;
++      continue;
++    }
++
++#ifdef NYX_D2R_SAFE_DIAGNOSTIC_MODE
++    sig.diagnostics.push_back(
++        BuildMatchDiagnostic(pattern, sig.offset_type, buffer_, module_base_, module_size_, buffer_offset, true));
++    LogExactMatch(sig.name, pattern, sig.offset_type, buffer_, module_base_, module_size_, buffer_offset);
++#endif
++
+     *sig.target = resolved;
+     sig.offset = reinterpret_cast<uint64_t>(resolved) - module_base_;
+     ++found_count;
+diff --git a/dolos/src/dolos/pattern_scanner.h b/dolos/src/dolos/pattern_scanner.h
+index 88982fa..5d630b9 100644
+--- a/dolos/src/dolos/pattern_scanner.h
++++ b/dolos/src/dolos/pattern_scanner.h
+@@ -22,6 +22,13 @@ struct ParsedPattern {
+   static std::optional<ParsedPattern> Parse(std::string_view pattern);
+ };
+ 
++struct SignatureMatchDiagnostic {
++  std::uint64_t match_offset = 0;
++  std::uint64_t resolved_offset = 0;
++  bool in_image = false;
++  bool accepted = false;
++};
++
+ struct SignatureDef {
+   const char* name;          // Offset name for logging/caching
+   std::string_view pattern;  // Pattern string to search for
+@@ -30,6 +37,7 @@ struct SignatureDef {
+   uint64_t offset;           // Relative offset
+ 
+   std::optional<ParsedPattern> parsed;
++  std::vector<SignatureMatchDiagnostic> diagnostics;
+ };
+ 
+ class PatternScanner {
+diff --git a/dolos/src/dolos/pipe_log.cc b/dolos/src/dolos/pipe_log.cc
+index 98962dc..3f7e2ab 100644
+--- a/dolos/src/dolos/pipe_log.cc
++++ b/dolos/src/dolos/pipe_log.cc
+@@ -1,17 +1,49 @@
+ #include "dolos/pipe_log.h"
+ 
+ #include <spdlog/pattern_formatter.h>
++#include <spdlog/sinks/basic_file_sink.h>
++
++#include <vector>
++
++extern "C" IMAGE_DOS_HEADER __ImageBase;
+ 
+ namespace dolos {
+ 
+ static std::shared_ptr<pipe_sink_mt> g_pipe_sink;
+ 
++static std::string GetNativeLogPath() {
++  char module_path[MAX_PATH]{};
++  if (!GetModuleFileNameA(reinterpret_cast<HMODULE>(&__ImageBase), module_path, MAX_PATH)) {
++    return "dolos-native.log";
++  }
++
++  std::string path(module_path);
++  const auto slash = path.find_last_of("\\/");
++  if (slash == std::string::npos) {
++    return "dolos-native.log";
++  }
++
++  path.resize(slash + 1);
++  path += "dolos-native.log";
++  return path;
++}
++
+ bool InitializePipeLog(const std::string& logger_name) {
+-  g_pipe_sink = std::make_shared<pipe_sink_mt>();
++  const std::string pipe_name = "\\\\.\\pipe\\dolos_log_" + std::to_string(GetCurrentProcessId());
++  g_pipe_sink = std::make_shared<pipe_sink_mt>(pipe_name);
+   bool connected = g_pipe_sink->connect();
+ 
+-  auto logger = std::make_shared<spdlog::logger>(logger_name, g_pipe_sink);
+-  logger->set_pattern("[%l] %v");
++  std::vector<spdlog::sink_ptr> sinks;
++  sinks.push_back(g_pipe_sink);
++
++  try {
++    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(GetNativeLogPath(), true);
++    sinks.push_back(file_sink);
++  } catch (...) {
++  }
++
++  auto logger = std::make_shared<spdlog::logger>(logger_name, sinks.begin(), sinks.end());
++  logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+   logger->set_level(spdlog::level::trace);
+   logger->flush_on(spdlog::level::trace);
+   spdlog::set_default_logger(logger);
+diff --git a/lib/memory.js b/lib/memory.js
+index b99ff65..ae18eed 100644
+--- a/lib/memory.js
++++ b/lib/memory.js
+@@ -569,28 +569,29 @@ class MemoryModel {
+ 
+   // read a single object at address, guarding against circular pointer chains.
+   // visited is a Set<BigInt> of addresses already seen on the current traversal path.
+-  _readWithVisited(address, visited) {
++  _readWithVisited(address, visited, pointerDepth = Number.POSITIVE_INFINITY) {
+     const bigAddr = BigInt(address);
+ 
+     // Return cached object if it's from the current generation (same tick).
+     const cached = this._cache.get(bigAddr);
+-    if (cached !== undefined && cached.gen === MemoryModel._generation) {
+-      return cached.obj;
+-    }
+-
+-    const raw = binding.readMemoryIfChanged(bigAddr, this.size >>> 0);
+-    if (raw === undefined && cached !== undefined) {
+-      cached.gen = MemoryModel._generation;
+-      return cached.obj;
++    if (cached !== undefined && cached.gen === MemoryModel._generation &&
++        cached.pointerDepth >= pointerDepth) {
++      return cached.obj;
++    }
++
++    const raw = binding.readMemoryIfChanged(bigAddr, this.size >>> 0);
++    if (raw === undefined && cached !== undefined && cached.pointerDepth >= pointerDepth) {
++      cached.gen = MemoryModel._generation;
++      return cached.obj;
+     }
+     const buffer = raw ?? binding.readMemoryFast(bigAddr, this.size >>> 0);
+ 
+     const obj = new this.CursorClass(bigAddr, buffer, 1, this.size, MemoryModel._registry);
+ 
+-    this._cache.set(bigAddr, { obj, gen: MemoryModel._generation });
++    this._cache.set(bigAddr, { obj, gen: MemoryModel._generation, pointerDepth });
+ 
+     const pointerModelFields = this._resolvedPointerFields;
+-    if (pointerModelFields.length > 0) {
++    if (pointerModelFields.length > 0 && pointerDepth > 0) {
+       const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+       const elemCache = {};
+       for (const field of pointerModelFields) {
+@@ -599,7 +600,7 @@ class MemoryModel {
+           elemCache[field.name] = null;
+         } else {
+           visited.add(ptr);
+-          elemCache[field.name] = field.resolvedModel._readWithVisited(ptr, visited);
++          elemCache[field.name] = field.resolvedModel._readWithVisited(ptr, visited, pointerDepth - 1);
+         }
+       }
+       obj._pointerModelCache = [elemCache];
+@@ -659,7 +660,7 @@ class MemoryModel {
+     // Find pointer model fields that need eager loading (thunks resolved once, lazily)
+     const pointerModelFields = this._resolvedPointerFields;
+ 
+-    cursor.$load = (address, count) => {
++    cursor.$load = (address, count, pointerDepth = Number.POSITIVE_INFINITY) => {
+       if (count > maxCount) {
+         throw new Error(`count ${count} exceeds maxCount ${maxCount}`);
+       }
+@@ -689,7 +690,7 @@ class MemoryModel {
+       cursor._idx = 0;
+       cursor._off = 0;
+ 
+-      if (pointerModelFields.length > 0) {
++      if (pointerModelFields.length > 0 && pointerDepth > 0) {
+         const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+         const cache = new Array(count);
+         const visited = new Set();
+@@ -702,7 +703,7 @@ class MemoryModel {
+             } else {
+               visited.clear();
+               visited.add(ptr);
+-              elemCache[field.name] = field.resolvedModel._readWithVisited(ptr, visited);
++              elemCache[field.name] = field.resolvedModel._readWithVisited(ptr, visited, pointerDepth - 1);
+             }
+           }
+           cache[i] = elemCache;
+diff --git a/src/nyx/gui/panel.cc b/src/nyx/gui/panel.cc
+index db94517..426e3ba 100644
+--- a/src/nyx/gui/panel.cc
++++ b/src/nyx/gui/panel.cc
+@@ -112,6 +112,8 @@ void PanelWidget::Render() {
+   if (!open_) return;
+ 
+   bool was_open = open_;
++  ImGui::SetNextWindowSize(ImVec2(440.0f, 520.0f), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 160.0f), ImVec2(10000.0f, 10000.0f));
+   panel_visible_ = ImGui::Begin(title_.c_str(), &open_, flags_);
+   if (panel_visible_) {
+     RenderChildren();
+diff --git a/src/nyx/imgui_draw_context.cc b/src/nyx/imgui_draw_context.cc
+index 02c473b..a789dbc 100644
+--- a/src/nyx/imgui_draw_context.cc
++++ b/src/nyx/imgui_draw_context.cc
+@@ -10,6 +10,9 @@ ImGuiDrawContext::ImGuiDrawContext(NyxImGui* nyx_imgui) : nyx_imgui_(nyx_imgui)
+   ImGui::SetCurrentContext(ctx_);
+   ImGuiIO& io = ImGui::GetIO();
+   io.IniFilename = nullptr;
++  // The runtime can start while the game is minimized or before its first
++  // Present call. ImGui requires a positive size even for that initial frame.
++  io.DisplaySize = ImVec2(1.0f, 1.0f);
+   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+   io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+   io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+diff --git a/src/nyx/nyx.cc b/src/nyx/nyx.cc
+index e0f5a24..029fd44 100644
+--- a/src/nyx/nyx.cc
++++ b/src/nyx/nyx.cc
+@@ -42,6 +42,8 @@ static std::string scripts_root_;
+ static FILE* g_stdout_{stdout};
+ static FILE* g_stderr_{stderr};
+ 
++static void OnUiFrameTimer(uv_timer_t*) {}
++
+ void SetStdout(FILE* stream) {
+   g_stdout_ = stream ? stream : stdout;
+ }
+@@ -63,6 +65,12 @@ static void SpinEventLoop(Environment* env) {
+ 
+   ImGuiDrawContext* draw_ctx = env->draw_context();
+ 
++  // Script timers may intentionally run at a low frequency. Keep ImGui input
++  // and rendering responsive independently from those application timers.
++  uv_timer_t ui_frame_timer;
++  uv_timer_init(env->event_loop(), &ui_frame_timer);
++  uv_timer_start(&ui_frame_timer, OnUiFrameTimer, 0, 16);
++
+   if (draw_ctx) {
+     draw_ctx->BeginFrame();
+   }

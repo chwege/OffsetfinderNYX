@@ -1,0 +1,36 @@
+{
+  "debugLog": false,
+  "logsDir": "logs",
+  "script": {
+    "enabled": false,
+    "minLevel": "debug",
+    "toConsole": false,
+    "toFile": false,
+    "fileName": "script.log"
+  },
+  "unitExplorer": {
+    "enabled": false,
+    "minLevel": "info",
+    "toConsole": false,
+    "toFile": true,
+    "fileName": "unit-explorer-perf.log"
+  },
+  "exitMarkers": {
+    "enabled": true,
+    "periodic": false,
+    "overlay": false,
+    "minLevel": "info",
+    "toConsole": false,
+    "toFile": true,
+    "fileName": "exit-markers-perf.log"
+  },
+  "objectManager": {
+    "enabled": false,
+    "chainWarnings": false,
+    "riskCircuit": true,
+    "minLevel": "info",
+    "toConsole": false,
+    "toFile": false,
+    "fileName": "object-manager.log"
+  }
+}

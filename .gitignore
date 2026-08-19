@@ -1,0 +1,30 @@
+# Directories
+.vs
+out
+enc_temp_folder
+certs
+diagnostic-logs
+scripts/logs
+
+# Files
+*.user
+
+## Ignore Visual Studio solution/project files
+*.sln
+*.vcxproj*
+
+*.pyc
+*.lib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.obj
+*.pdb
+*.tmp
+*.cache
+
+# Local signing material and runtime diagnostics
+*.pfx
+*.pvk
+*.log
